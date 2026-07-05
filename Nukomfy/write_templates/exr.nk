@@ -1,0 +1,11 @@
+Input {
+ inputs 0
+ name Input1
+}
+Write {
+ file_type exr
+ compression DWAB
+ dw_compression_level 75
+ first_part rgba
+ name Write1
+}

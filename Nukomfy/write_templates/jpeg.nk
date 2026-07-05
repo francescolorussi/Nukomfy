@@ -1,0 +1,10 @@
+Input {
+ inputs 0
+ name Input1
+}
+Write {
+ file_type jpeg
+ _jpeg_quality 1
+ checkHashOnRead false
+ name Write1
+}

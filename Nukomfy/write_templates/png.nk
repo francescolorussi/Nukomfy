@@ -1,0 +1,9 @@
+Input {
+ inputs 0
+ name Input1
+}
+Write {
+ file_type png
+ checkHashOnRead false
+ name Write1
+}

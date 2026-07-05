@@ -1,0 +1,7 @@
+# settings_overrides/ - Read-only overrides folder
+
+Place `nukomfy_settings.json` and/or `nukomfy_machines.json` here to impose
+read-only overrides on every artist who runs this plugin install.
+Files are read at Nuke boot only. Empty folder = no override.
+
+See USER_GUIDE.md for the full how-to and JSON examples.
