@@ -12,7 +12,7 @@ TDs set up each gizmo once. Artists tweak only the essential knobs, directly in 
 
 ## Demo
 
-https://github.com/user-attachments/assets/c2b74f2e-ee4f-40f2-899b-60b9cad5e2dd
+https://github.com/user-attachments/assets/5120bfa3-8b6a-4083-87aa-6c2aa44be6b9
 
 ## How it works
 
