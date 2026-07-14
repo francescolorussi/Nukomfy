@@ -4,6 +4,7 @@
   <img src="https://img.shields.io/badge/version-0.1.0-orange" alt="Version 0.1.0">
   <img src="https://img.shields.io/badge/license-Apache_2.0-blue" alt="License: Apache 2.0">
   <img src="https://img.shields.io/badge/Nuke-14.1%2B-F9B41B" alt="Nuke 14.1+">
+  <a href="https://www.nukepedia.com/tools/python/render/nukomfy/"><img src="https://img.shields.io/badge/Nukepedia-Nukomfy-%23E04D19" alt="Nukepedia"></a>
 </p>
 
 **Nukomfy** is a Python plugin for **Foundry Nuke** that lets you turn **ComfyUI** workflows into reusable Nuke gizmos, send jobs to ComfyUI machines on your network, monitor progress in real time, and import the generated frames straight back into your comp.
