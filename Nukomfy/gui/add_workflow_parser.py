@@ -11,9 +11,12 @@ import json
 import logging
 import os
 import re
+from urllib.parse import unquote
 
 from Nukomfy.utils.qt_compat import QtCore
-from Nukomfy.workflows.workflow_converter import _VIRTUAL_NODE_TYPES
+from Nukomfy.workflows.workflow_converter import (
+    _VIRTUAL_NODE_TYPES, _declared_widget_type, _object_widget_slots,
+    _promoted_host_values, _promoted_widget_chain)
 
 _log = logging.getLogger(__name__)
 
@@ -232,6 +235,10 @@ _AUTO_FILE_PATH_NODES = {
 # A workflow must contain at least one of these to be loadable,
 # since Nukomfy's submit pipeline is built around them.
 _NUKOMFY_NODE_TYPES = {'NukomfyRead', 'NukomfyWrite'}
+
+# App Builder input id written by frontend 1.46.3+: "<root graph id>:<node id>:
+# <widget name>", the last two URI-encoded from 1.47.2.
+_WIDGET_ID_RE = re.compile(r'^([^:]+):([^:]+):([^:]+)$')
 
 # Sentinels passed through _ParamWorker.finished's error_msg field
 # so _on_params_fetched can show the dedicated rich-text dialog
@@ -487,35 +494,68 @@ def _classify_node_states(workflow_json, api_id_map, info_cache=None):
     state change is more informative than the structural label. All
     three states get the same grey-and-disable treatment in the
     Workflow Creator tables (the Enabled checkbox is forced off).
+    The inner nodes of a muted or bypassed subgraph instance take its
+    state, since none of them is sent (one level, as _build_api_id_map).
+    The nodes of nested instances are also classified by their full id
+    ('outer:nested:inner'), taking the state of any muted or bypassed
+    instance on the way: a row reaches them through a promoted input.
     """
     state = {}
     live = _live_node_ids_for_workflow(workflow_json, info_cache)
+    host_modes = {n.get('type'): n.get('mode', 0) or 0
+                  for n in workflow_json.get('nodes', []) or []}
+    defs = {sg.get('id'): sg
+            for sg in workflow_json.get('definitions', {}).get('subgraphs', []) or []
+            if sg.get('id')}
 
-    def _scan(nodes):
+    def _classify(api_id, n, host_mode):
+        mode = n.get('mode', 0) or 0
+        if mode not in (2, 4):
+            mode = host_mode
+        if mode == 4:
+            state[api_id] = 'bypassed'
+        elif mode == 2:
+            state[api_id] = 'muted'
+        elif n.get('type', '') in _VIRTUAL_NODE_TYPES:
+            pass
+        elif live is not None:
+            if api_id not in live:
+                state[api_id] = 'disconnected'
+        elif not _node_has_any_connection(n):
+            state[api_id] = 'disconnected'
+
+    def _scan(nodes, host_mode=0):
         for n in nodes or []:
             nid = n.get('id')
             if nid is None:
                 continue
-            api_id = api_id_map.get(nid, str(nid))
+            _classify(api_id_map.get(nid, str(nid)), n, host_mode)
+
+    def _scan_nested(path, sg, host_mode, depth):
+        for n in sg.get('nodes', []) or []:
+            ntype = n.get('type')
+            nested = defs.get(ntype) if isinstance(ntype, str) else None
+            if nested is None or n.get('id') is None or depth >= 10:
+                continue
+            nested_path = '{}:{}'.format(path, n.get('id'))
             mode = n.get('mode', 0) or 0
-            if mode == 4:
-                state[api_id] = 'bypassed'
-                continue
-            if mode == 2:
-                state[api_id] = 'muted'
-                continue
-            ntype = n.get('type', '')
-            if ntype in _VIRTUAL_NODE_TYPES:
-                continue
-            if live is not None:
-                if api_id not in live:
-                    state[api_id] = 'disconnected'
-            elif not _node_has_any_connection(n):
-                state[api_id] = 'disconnected'
+            if mode not in (2, 4):
+                mode = host_mode
+            for inner in nested.get('nodes', []) or []:
+                if inner.get('id') is not None:
+                    _classify('{}:{}'.format(nested_path, inner.get('id')),
+                              inner, mode)
+            _scan_nested(nested_path, nested, mode, depth + 1)
 
     _scan(workflow_json.get('nodes', []))
     for sg in workflow_json.get('definitions', {}).get('subgraphs', []) or []:
-        _scan(sg.get('nodes', []))
+        _scan(sg.get('nodes', []), host_modes.get(sg.get('id'), 0))
+    for n in workflow_json.get('nodes', []) or []:
+        ntype = n.get('type')
+        sg = defs.get(ntype) if isinstance(ntype, str) else None
+        if sg is not None and n.get('id') is not None:
+            mode = n.get('mode', 0) or 0
+            _scan_nested(str(n.get('id')), sg, mode if mode in (2, 4) else 0, 1)
     return state
 
 
@@ -631,7 +671,7 @@ def _build_widget_defaults(info, widgets_values):
     def _is_widget(input_def):
         if not isinstance(input_def, (list, tuple)) or not input_def:
             return False
-        t = input_def[0]
+        t = _declared_widget_type(input_def)
         if isinstance(t, list):
             return True  # COMBO old format
         return isinstance(t, str) and t.upper() in _WIDGET_TYPES
@@ -646,7 +686,12 @@ def _build_widget_defaults(info, widgets_values):
         ordered_names = input_order.get(section, list(section_data.keys()))
         for name in ordered_names:
             input_def = section_data.get(name)
-            if _is_widget(input_def):
+            # Object-valued widgets (a curve, a crop region) take their slots
+            # too; their helper widgets' slots are None.
+            slots = _object_widget_slots(name, input_def, all_widgets, info.get('name'))
+            if slots is not None:
+                all_widgets.extend(slots)
+            elif _is_widget(input_def):
                 all_widgets.append(name)
 
     # V3 master detection helpers. A DYNAMICCOMBO_V3 widget expands its
@@ -666,7 +711,7 @@ def _build_widget_defaults(info, widgets_values):
     def _sub_is_widget(spec):
         if not isinstance(spec, (list, tuple)) or not spec:
             return False
-        t = spec[0]
+        t = _declared_widget_type(spec)
         if isinstance(t, list):
             return True  # COMBO old format (list of values)
         if not isinstance(t, str):
@@ -743,8 +788,10 @@ def _build_widget_defaults(info, widgets_values):
         if idx >= len(widgets_values):
             break
         value = widgets_values[idx]
-        result[wn] = value
         idx += 1
+        if wn is None:
+            continue
+        result[wn] = value
         # A control_after_generate companion only ever follows the seed's
         # integer value. The same literal strings are legitimate option
         # values of unrelated combo widgets: consuming one of those would
@@ -1448,7 +1495,7 @@ def _enrich_params(params, server_urls, subgraph_uuids=None):
             if not isinstance(input_def, (list, tuple)) or not input_def:
                 continue
 
-            type_or_values = input_def[0]
+            type_or_values = _declared_widget_type(input_def)
             extra = input_def[1] if len(input_def) > 1 and isinstance(input_def[1], dict) else {}
 
             # forceInput widgets are sockets in ComfyUI - not editable
@@ -3341,6 +3388,80 @@ def _parse_app_inputs(workflow_json):
             for sg in workflow_json.get('definitions', {}).get('subgraphs', []) or []
             if sg.get('id')
         }
+        root_nodes = {str(n.get('id')): n
+                      for n in workflow_json.get('nodes', []) or []}
+
+        def _entry_host(stored_id, name):
+            """``(instance, input name)`` for an entry on an input of a root
+            subgraph instance, saved as a widget id or in the legacy
+            ``[instance id, input]`` form (read as the frontend does, the root
+            node first); ``(None, None)`` otherwise."""
+            m = _WIDGET_ID_RE.match(stored_id) if isinstance(stored_id, str) else None
+            if m:
+                if m.group(1) != workflow_json.get('id'):
+                    return None, None
+                stored_id, name = unquote(m.group(2)), unquote(m.group(3))
+            root = root_nodes.get(str(stored_id))
+            if root is None or root.get('type', '') not in subgraph_defs_by_uuid:
+                return None, None
+            return root, name
+
+        def _resolve_host_input(host, name):
+            """``(node, api_id, widget_name, first_key, default)`` for the
+            input `name` of the root instance `host`, or None if it feeds no
+            widget. The node is the one the frontend shows for the input: the
+            first inner widget it feeds, followed through nested instances.
+            ``first_key`` is that first target, the key of its boundary label;
+            the default is the instance's value or, saved without one, the
+            value of the first nested instance down the chain that has one."""
+            chain = _promoted_widget_chain(
+                subgraph_defs_by_uuid.get(host.get('type', '')), name,
+                subgraph_defs_by_uuid)
+            if not chain:
+                return None
+            first_path, _, first_widget = chain[0]
+            first_key = ('{}:{}'.format(host.get('id'), first_path), first_widget)
+            path, inner, widget = chain[-1]
+            if inner.get('type', '') in subgraph_defs_by_uuid:
+                # No widget behind the nested instance: keep its input.
+                path, inner, widget = chain[0]
+            value = promoted_defaults.get(first_key)
+            for (_, nested, _), (_, nxt, nxt_widget) in zip(chain, chain[1:]):
+                if value is not None:
+                    break
+                value = _promoted_host_values(
+                    nested, subgraph_defs_by_uuid.get(nested.get('type', ''), {}),
+                    include_linked=True).get((nxt.get('id'), nxt_widget))
+            return (inner, '{}:{}'.format(host.get('id'), path), widget,
+                    first_key, value)
+
+        def _resolve_widget_id(stored_id):
+            """Return ``(node, api_id, widget_name)`` for an entry saved as a
+            widget id on a node other than a root subgraph instance, or None
+            for the legacy ``[node id, widget]`` form and for an id that does
+            not resolve."""
+            m = _WIDGET_ID_RE.match(stored_id) if isinstance(stored_id, str) else None
+            if not m or m.group(1) != workflow_json.get('id'):
+                return None
+            nid, name = unquote(m.group(2)), unquote(m.group(3))
+            root = root_nodes.get(nid)
+            if root is None:
+                # A widget inside a subgraph selected without promotion: the
+                # id holds the inner node id alone, as the legacy form does.
+                inner = nodes_by_id.get(nid)
+                return (inner, api_id_map.get(nid, nid), name) if inner else None
+            return root, nid, name
+
+        # A promoted widget's value lives on its subgraph instance, so that is
+        # where its default comes from.
+        promoted_defaults = {}
+        for host in workflow_json.get('nodes', []) or []:
+            sg = subgraph_defs_by_uuid.get(host.get('type', ''))
+            if sg is None:
+                continue
+            for (inner_id, widget), value in _promoted_host_values(host, sg).items():
+                promoted_defaults[('{}:{}'.format(host.get('id'), inner_id),
+                                   widget)] = value
 
         result = []
         for entry in linear['inputs']:
@@ -3349,8 +3470,26 @@ def _parse_app_inputs(workflow_json):
                              entry)
                 continue
             node_id, widget_name = entry[0], entry[1]
-            node = nodes_by_id.get(node_id, {})
-            api_id = api_id_map.get(node_id, str(node_id))
+            host, host_input = _entry_host(node_id, widget_name)
+            if host is not None:
+                # An input linked on the instance takes the link's value, so
+                # the entry is stale, as for a linked top-level widget below.
+                if any(i.get('name') == host_input and i.get('link') is not None
+                       for i in host.get('inputs') or []):
+                    continue
+                resolved = _resolve_host_input(host, host_input)
+            else:
+                resolved = _resolve_widget_id(node_id)
+                if resolved is not None:
+                    key = (resolved[1], resolved[2])
+                    resolved += (key, promoted_defaults.get(key))
+            if resolved is not None:
+                node, api_id, widget_name, first_key, default_value = resolved
+            else:
+                node = nodes_by_id.get(node_id, {})
+                api_id = api_id_map.get(node_id, str(node_id))
+                first_key = (api_id, widget_name)
+                default_value = promoted_defaults.get(first_key)
             node_state = node_state_map.get(api_id)
             if api_id in floating_nukomfy_reads and node_state is None:
                 # NukomfyRead with no downstream consumer that's also not
@@ -3401,7 +3540,7 @@ def _parse_app_inputs(workflow_json):
             # that name as its default Gizmo Label; a miss keeps the raw
             # widget name. Mirrors the subgraphs branch below, which already
             # reads the slot label.
-            boundary_label = boundary_labels.get((api_id, widget_name))
+            boundary_label = boundary_labels.get(first_key)
             p = {
                 'name':           widget_name,
                 'type':           inp_type,
@@ -3410,7 +3549,7 @@ def _parse_app_inputs(workflow_json):
                 'node_type':      node.get('type', ''),
                 'node_title':     _node_title(node),
                 'widget_name':    widget_name,
-                'default_value':  None,
+                'default_value':  default_value,
                 '_node_widgets_values': wv if isinstance(wv, (list, dict)) else [],
                 'is_output':      api_id in output_nodes,
                 '_node_state':    node_state,  # None|'bypassed'|'muted'

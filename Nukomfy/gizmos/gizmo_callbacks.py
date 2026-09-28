@@ -37,6 +37,11 @@ _PATH_PREVIEW_TRIGGERS = frozenset({
 _HIDDEN_FLAG = 0x40000
 _STARTLINE_FLAG = 0x1000
 
+# Expression pinning the gizmo's internal cache Writes to the GUI (see
+# _disable_cache_writes). Lives here, next to the load-time repair, so the
+# builder importing it cannot drift from what the repair writes.
+_GUI_ONLY_EXPR = '!$gui'
+
 # Text_Knob word-wrap. Nuke's low knob-flag bits are type-specific: on a
 # Text_Knob 0x1 is WORD_WRAP (it is MAGNITUDE on a numeric knob). Not exposed
 # as a named nuke.* constant, so the raw Knob.h hex is used. Re-applied in
@@ -67,6 +72,33 @@ def _is_path_trigger(name):
 # ---------------------------------------------------------------------------
 # onCreate - rebuild Multiline_Eval_String_Knob after paste / comp reload
 # ---------------------------------------------------------------------------
+def _disable_cache_writes(node):
+    """Pin the gizmo's internal cache Writes off outside the GUI.
+
+    They carry no file path at rest, so a batch render of every Write would
+    fail the whole script on them. The pin is an expression, so it holds if a
+    pipeline step re-saves the script, and a Write that already has one is
+    left alone; it assumes the cache render runs in-process in the GUI
+    (input_cache_writer). Children are read via node.nodes() because entering
+    the group during a script load corrupts the loader, and errors are
+    swallowed per child because a gizmo stub may catch only ImportError.
+    """
+    try:
+        children = node.nodes()
+    except Exception:
+        return
+    for child in children:
+        try:
+            if child.Class() != 'Write':
+                continue
+            k = child.knob('disable')
+            if k is None or k.hasExpression():
+                continue
+            k.setExpression(_GUI_ONLY_EXPR)
+        except Exception:
+            pass
+
+
 def on_create(node):
     """Rebuild multiline knobs so they render expanded after paste/reload.
 
@@ -76,7 +108,14 @@ def on_create(node):
     references to all trailing knobs, removing them, re-creating the
     multiline, then re-adding the trailing knobs unchanged (removeKnob
     only detaches - the Python objects keep their state).
+
+    Everything below the GUI check is panel presentation and has no bearing
+    on rendered pixels, so a render node only pays for the Write pinning.
     """
+    if not nuke.GUI:
+        _disable_cache_writes(node)
+        return
+
     # Re-resolve the header HTML on every load so a moved/renamed workflow
     # folder still resolves the logo image path (uses UUID lookup).
     _refresh_header_html(node)
@@ -258,6 +297,12 @@ def _fix_invalid_write_colorspaces(node):
 # knobChanged - seed validation + live output path preview
 # ---------------------------------------------------------------------------
 def on_knob_changed(node, knob):
+    # Seed validation, clamps and previews are all panel-side: nothing here
+    # feeds the render. Outside the GUI Nuke does not fire this during a
+    # script load anyway, so this only guards a pipeline script poking knobs.
+    if not nuke.GUI:
+        return
+
     try:
         knob_name = knob.name()
     except Exception:

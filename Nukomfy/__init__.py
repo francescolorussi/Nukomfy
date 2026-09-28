@@ -90,17 +90,23 @@ def _eager_import_consumers():
         _log.exception('Eager import failed (non-fatal)')
 
 
-_eager_import_consumers()
+# A gizmo's onCreate stub imports this package on every .nk load, render
+# nodes included, so importing must stay free of GUI side effects:
+# nuke.menu() raises RuntimeError outside the GUI, which aborts the script
+# load and fails the render. The panel pre-warm and the cache purge are
+# GUI-only work as well, and pointless on a render node.
+if nuke.GUI:
+    _eager_import_consumers()
 
-threading.Thread(
-    target=_auto_purge_input_cache, daemon=True,
-    name='nukomfy-cache-purge').start()
+    threading.Thread(
+        target=_auto_purge_input_cache, daemon=True,
+        name='nukomfy-cache-purge').start()
 
-menu = nuke.menu('Nuke').addMenu('Nukomfy')
-menu.addCommand('Library', _open_library)
-menu.addCommand('Render Manager', _open_render_queue)
-menu.addCommand('Settings', _open_settings)
-menu.addSeparator()
-menu.addCommand('About', _open_about)
+    menu = nuke.menu('Nuke').addMenu('Nukomfy')
+    menu.addCommand('Library', _open_library)
+    menu.addCommand('Render Manager', _open_render_queue)
+    menu.addCommand('Settings', _open_settings)
+    menu.addSeparator()
+    menu.addCommand('About', _open_about)
 
-_log.info('Nukomfy v%s ready', _APP_VERSION)
+    _log.info('Nukomfy v%s ready', _APP_VERSION)

@@ -25,7 +25,8 @@ from Nukomfy.gui._theme import (
     DETAIL_STYLE, BUTTON_STYLE_CELL_ACTION, cell_action_colored,
     SEARCH_FIELD_STYLE, SUCCESS_COLOR, SUCCESS_HOVER, apply_window_chrome)
 from Nukomfy.gui._no_wheel import NoWheelComboBox
-from Nukomfy.gui._render_data_store import _sent_at_to_epoch
+from Nukomfy.gui._render_data_store import (
+    _sent_at_to_epoch, _attach_client_machine_url)
 from Nukomfy.gui.ui_state import ui_state
 from Nukomfy.gui.render_queue_context_menu import (
     _add_copy_job_id, _add_show_output_folder)
@@ -325,7 +326,7 @@ class MachineJobsViewer(QtWidgets.QDialog):
             # client's address otherwise), while the Job dialog's workflow
             # fetch and Refresh need the URL THIS client reaches the
             # machine at.
-            e['nfy_machine_url'] = self._machine.url
+            _attach_client_machine_url(e, self._machine.url)
         self._total = int(payload.get('total_count') or 0)
         self._rebuild_rows(entries)
         self._update_pager()

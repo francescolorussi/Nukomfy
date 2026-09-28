@@ -22,6 +22,7 @@ import datetime as _dt
 
 import Nukomfy.data.submit_history as submit_history
 from Nukomfy.utils.qt_compat import QtCore
+from Nukomfy.utils.url_obfuscation import is_obfuscated
 
 
 def _sent_at_to_epoch(sent_at):
@@ -38,6 +39,25 @@ def _sent_at_to_epoch(sent_at):
         except (ValueError, TypeError):
             return 0.0
     return 0.0
+
+
+def _attach_client_machine_url(entry, machine_url):
+    """Re-point a server-sourced job entry at the URL this client uses.
+
+    The entry carries the submitter's address for the machine (another
+    workstation's, or an opaque `nfyo:` blob where it was hidden), which this
+    client cannot route to, and the Job dialog fetches the workflow API from
+    this field. The blob is the only sign the machine was hidden, so it is
+    folded into `nfy_machine_hidden_url` first. Mutates and returns *entry*;
+    not for local-history entries, which keep their submit-time snapshot.
+    """
+    if not isinstance(entry, dict):
+        return entry
+    if 'nfy_machine_hidden_url' not in entry:
+        entry['nfy_machine_hidden_url'] = is_obfuscated(
+            entry.get('nfy_machine_url'))
+    entry['nfy_machine_url'] = machine_url
+    return entry
 
 
 class RenderDataStore(QtCore.QObject):
@@ -124,14 +144,14 @@ class RenderDataStore(QtCore.QObject):
         for job in running:
             if not isinstance(job, dict):
                 continue
-            job['nfy_machine_url'] = machine_url
+            _attach_client_machine_url(job, machine_url)
             pid = job.get('prompt_id')
             if pid:
                 self._running_jobs[pid] = job
         for job in pending:
             if not isinstance(job, dict):
                 continue
-            job['nfy_machine_url'] = machine_url
+            _attach_client_machine_url(job, machine_url)
             pid = job.get('prompt_id')
             if pid:
                 self._pending_jobs[pid] = job
@@ -156,7 +176,7 @@ class RenderDataStore(QtCore.QObject):
         for detail in fetch_result.get('new_terminals') or []:
             pid = detail.get('prompt_id') if isinstance(detail, dict) else None
             if pid:
-                cache[pid] = detail
+                cache[pid] = _attach_client_machine_url(detail, machine_url)
         # 2.5 Server-side persistent terminals (manager-aware machines).
         # Purely additive: covers pids that step 2 would not reach (other
         # users, plus entries rolled off ComfyUI's in-memory history after
@@ -170,7 +190,7 @@ class RenderDataStore(QtCore.QObject):
             pid = entry.get('prompt_id')
             if not pid or pid in cache:
                 continue
-            merged = dict(entry)
+            merged = _attach_client_machine_url(dict(entry), machine_url)
             ct = merged.get('create_time')
             if not isinstance(ct, (int, float)) or not ct:
                 merged['create_time'] = _sent_at_to_epoch(

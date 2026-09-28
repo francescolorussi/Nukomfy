@@ -1993,9 +1993,9 @@ class SettingsPanel(QtWidgets.QDialog):
         self._build()
         # Settings always opens at this default size, centered - neither size
         # nor position is persisted, so it reopens fresh every time. resize()
-        # (not adjustSize) keeps the opening size identical to before at 100%;
-        # the minimum height clamps it as needed. This is the single source
-        # for the Settings default size (no longer stored in ui_state).
+        # (not adjustSize) sets an explicit opening size; the minimum height
+        # clamps it as needed. This is the single source for the Settings
+        # default size (ui_state does not store it).
         self.resize(1360, 780)
         # Only on a screen too small for the default: shrink to fit, then wrap
         # the form tabs so their content scrolls. No-op (and no wrapping) when

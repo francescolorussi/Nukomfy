@@ -671,8 +671,8 @@ class AddWorkflowDialog(QtWidgets.QDialog):
         # oversized PNG/JPG/WEBP is automatically capped. GIFs keep their
         # original dimensions (no multi-frame encoder available). A second
         # preview turns the Library card into a before/after comparison
-        # slider; one image alone behaves exactly as before. Split into two
-        # equal columns to keep the same overall width.
+        # slider; with one image the card shows just that image. Split into
+        # two equal columns to keep the same overall width.
         def _make_preview_col(title, tip, kind, browse_cb, reset_cb):
             grp = QtWidgets.QGroupBox(title)
             grp.setToolTip(tip)

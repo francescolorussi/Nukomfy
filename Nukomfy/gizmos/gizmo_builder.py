@@ -17,7 +17,7 @@ from Nukomfy.workflows._payload import encode_payload
 from Nukomfy.gui._theme import LINK_FG
 from Nukomfy.utils.suite_rules import suite_dependents
 from Nukomfy.gizmos.gizmo_callbacks import (
-    _HIDDEN_FLAG, _STARTLINE_FLAG, _WORD_WRAP_FLAG)
+    _GUI_ONLY_EXPR, _HIDDEN_FLAG, _STARTLINE_FLAG, _WORD_WRAP_FLAG)
 
 _log = logging.getLogger(__name__)
 
@@ -213,19 +213,32 @@ def _layout_chain(nodes, base_x, base_y=0, dy=80, dx=110):
 
 def _force_safe_write_knobs(write):
     """Force the internal Write into a state safe for cache rendering and a
-    correct round-trip: not reading a file back, no frame-range clamp,
-    enabled, single view (keeps the cache one sequence matching the file
-    pattern), auto-create dirs. Every other knob stays as the template set
-    it (file_type, compression, colorspace, channels, ...)."""
+    correct round-trip: not reading a file back, no frame-range clamp, on in
+    the GUI and off everywhere else, single view (keeps the cache one sequence
+    matching the file pattern), auto-create dirs. Every other knob stays as
+    the template set it (file_type, compression, colorspace, channels, ...)."""
     missing = []
     for name, val in (('reading', False), ('use_limit', False),
-                      ('disable', False), ('create_directories', True)):
+                      ('create_directories', True)):
         k = write.knob(name)
         if k is None:
             missing.append(name)
             continue
         try:
             k.setValue(val)
+        except Exception:
+            pass
+
+    # 'disable' is pinned by expression, not by value: this Write must run
+    # when submit renders the cache (GUI, in-process) and stay off in a batch
+    # render, where it holds no file path and would fail the whole script.
+    # Serialised into the .nk, so it holds even where Nukomfy is not installed.
+    disable_k = write.knob('disable')
+    if disable_k is None:
+        missing.append('disable')
+    else:
+        try:
+            disable_k.setExpression(_GUI_ONLY_EXPR)
         except Exception:
             pass
     vk = write.knob('views')
@@ -545,9 +558,11 @@ def _assign_unique_knob_names(params):
 # ---------------------------------------------------------------------------
 # Callback stubs - thin wrappers that import gizmo_callbacks at runtime.
 # Automatic callbacks (onCreate, knobChanged) silently swallow ImportError
-# so the gizmo can be pasted into a vanilla Nuke without spam. User-clicked
-# buttons (Submit, Read Outputs, Version up/down/latest) instead show a
-# friendly popup pointing to the install page.
+# so the gizmo can be pasted into a vanilla Nuke without spam. Any other
+# failure is printed but never re-raised: these callbacks are presentation
+# work, and letting one escape aborts the .nk load, which fails an entire
+# batch render. User-clicked buttons (Submit, Read Outputs, Version
+# up/down/latest) instead show a friendly popup pointing to the install page.
 # ---------------------------------------------------------------------------
 _NUKOMFY_REQUIRED_MSG = (
     '<p><b>Nukomfy is not installed</b></p>'
@@ -580,7 +595,10 @@ _ONCREATE_STUB = (
     '    from Nukomfy.gizmos.gizmo_callbacks import on_create\n'
     '    on_create(nuke.thisNode())\n'
     'except ImportError:\n'
-    '    pass'
+    '    pass\n'
+    'except Exception:\n'
+    '    import traceback\n'
+    '    traceback.print_exc()'
 )
 
 _KNOB_CHANGED_STUB = (
@@ -588,7 +606,10 @@ _KNOB_CHANGED_STUB = (
     '    from Nukomfy.gizmos.gizmo_callbacks import on_knob_changed\n'
     '    on_knob_changed(nuke.thisNode(), nuke.thisKnob())\n'
     'except ImportError:\n'
-    '    pass'
+    '    pass\n'
+    'except Exception:\n'
+    '    import traceback\n'
+    '    traceback.print_exc()'
 )
 
 _VERSION_UP_STUB = _user_button_stub(

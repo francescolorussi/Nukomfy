@@ -305,6 +305,262 @@ def _expand_subgraph(subgraph_node_id, subgraph_def, workflow_links):
     return expanded_nodes, expanded_links, input_slot_to_internal, internal_to_output_slot
 
 
+def _subgraph_widget_targets(subgraph_def):
+    """Map each widget-backed input of a subgraph to the inner widgets it feeds.
+
+    Returns ``{input_name: [(inner_node, widget_name), ...]}`` in definition
+    order, listing only the inputs that reach at least one inner widget: the
+    ones the frontend promotes onto the instance node, which shows the first
+    target.
+    """
+    inner_nodes = {n.get('id'): n for n in subgraph_def.get('nodes', []) or []}
+    links = {
+        lnk.get('id'): lnk for lnk in subgraph_def.get('links', []) or []
+        if isinstance(lnk, dict)
+    }
+    targets = {}
+    for sg_input in subgraph_def.get('inputs', []) or []:
+        feeds = []
+        for link_id in sg_input.get('linkIds', []) or []:
+            link = links.get(link_id) or {}
+            inner = inner_nodes.get(link.get('target_id'))
+            slot = link.get('target_slot')
+            inner_inputs = (inner or {}).get('inputs') or []
+            if not isinstance(slot, int) or not 0 <= slot < len(inner_inputs):
+                continue
+            widget_name = (inner_inputs[slot].get('widget') or {}).get('name')
+            if widget_name:
+                feeds.append((inner, widget_name))
+        if feeds:
+            targets[sg_input.get('name')] = feeds
+    return targets
+
+
+def _promoted_host_values(host_node, subgraph_def, include_linked=False):
+    """Return ``{(inner_id, widget_name): value}`` for the promoted widgets
+    whose value lives on the subgraph instance node.
+
+    From frontend 1.46.3 the instance stores a promoted widget's value in
+    `widgets_values` (one entry per widget-backed input, in definition order),
+    the inner widget keeps a stale copy, and the frontend sends the instance
+    value to every inner widget the input feeds; files from older frontends
+    leave the list empty or mirror the inner values. Inputs linked on the
+    instance are left to the link unless `include_linked` is set (a nested
+    instance's input is linked from the enclosing one), and a length mismatch
+    yields {} rather than a guessed alignment.
+    """
+    values = host_node.get('widgets_values')
+    targets = _subgraph_widget_targets(subgraph_def)
+    if not isinstance(values, list) or not values or len(values) != len(targets):
+        return {}
+    linked = set() if include_linked else {
+        inp.get('name') for inp in host_node.get('inputs', []) or []
+        if inp.get('link') is not None
+    }
+    result = {}
+    for (input_name, feeds), value in zip(targets.items(), values):
+        if value is None or input_name in linked:
+            continue
+        for inner, widget_name in feeds:
+            result[(inner.get('id'), widget_name)] = value
+    return result
+
+
+def _promoted_socket_feeds(host_node, subgraph_def):
+    """Return ``[(socket_id, input_name, widget_id, widget_name)]``: the inner
+    sockets fed by a promoted input left unlinked on the instance, each with
+    the first inner widget that input feeds.
+
+    The frontend sends such a socket the input's value, which that widget
+    receives too: the instance's, or in older files the widget's own.
+    """
+    widgets = _subgraph_widget_targets(subgraph_def)
+    linked = {
+        inp.get('name') for inp in host_node.get('inputs', []) or []
+        if inp.get('link') is not None
+    }
+    result = []
+    for sg_input in subgraph_def.get('inputs', []) or []:
+        name = sg_input.get('name')
+        if name not in widgets or name in linked:
+            continue
+        first, widget_name = widgets[name][0]
+        link_ids = set(sg_input.get('linkIds', []) or [])
+        for inner in subgraph_def.get('nodes', []) or []:
+            for inp in inner.get('inputs', []) or []:
+                if inp.get('link') in link_ids and not inp.get('widget'):
+                    result.append((inner.get('id'), inp.get('name'),
+                                   first.get('id'), widget_name))
+    return result
+
+
+def _promoted_widget_chain(subgraph_def, input_name, subgraph_defs):
+    """Return ``[(path, node, widget_name), ...]``: the first inner widget a
+    promoted input feeds and, while that is the input of a nested instance,
+    the first widget that one feeds, down to the widget the frontend shows
+    for the input. ``path`` is the node's id path inside the instance
+    ('3', '3:7'); the list is empty when the input feeds no widget.
+    """
+    chain = []
+    path = ''
+    for _ in range(10):     # ui_to_api expands ten levels
+        feeds = _subgraph_widget_targets(subgraph_def).get(input_name)
+        if not feeds:
+            break
+        node, input_name = feeds[0]
+        path = '{}:{}'.format(path, node.get('id')) if path else str(node.get('id'))
+        chain.append((path, node, input_name))
+        node_type = node.get('type')
+        subgraph_def = (subgraph_defs.get(node_type)
+                        if isinstance(node_type, str) else None)
+        if subgraph_def is None:
+            break
+    return chain
+
+
+def _param_key(p):
+    """The (node id, input) a param's own value is written to."""
+    return (str(p.get('target_node_id', '')),
+            p.get('widget_name', p.get('name', '')))
+
+
+def param_value_targets(workflow_json, gizmo_params):
+    """Return ``{(node_id, widget_name): [(node_id, input_name), ...]}``: the
+    inputs of the prompt a param's value is written to, for each param whose
+    value the frontend gives to inputs other than its own target.
+
+    An input promoted on an instance in the root graph and left unlinked gives
+    its value to each inner widget and socket it feeds, down through nested
+    instances. A param on that input, or on the first inner widget it feeds
+    and on down through nested instances (_promoted_widget_chain: what the
+    parser builds from an App Builder entry, and what the frontend upgrades a
+    legacy entry to), carries its value to all of them; one on another of
+    them keeps its own. An inner widget no subgraph input feeds is
+    one widget of its definition, shared by all of its instances. An input
+    another param is on keeps that param's value.
+
+    Left out, as the parser gives them the value saved on the inner node
+    rather than the one the frontend holds: the NukomfyRead / NukomfyWrite
+    widgets it adds by itself, the sub-inputs of a DynamicCombo, the own value
+    of a nested instance (the frontend drops App Builder entries on it).
+    """
+    defs = {
+        sg.get('id'): sg
+        for sg in (workflow_json.get('definitions') or {}).get('subgraphs') or []
+        if sg.get('id')
+    }
+    if not defs:
+        return {}
+
+    def definition(node):
+        node_type = node.get('type')
+        return defs.get(node_type) if isinstance(node_type, str) else None
+
+    source_of = {}      # input -> the root instance input it takes the value of
+    members = {}        # root instance input -> the inputs that take its value
+    heads = {}          # root instance input -> the keys that stand for it
+    definition_of = {}  # instance path -> its definition
+    instances = {}      # definition id -> its instance paths
+
+    # fed: for a nested instance, the source of each input the enclosing
+    # instance passes down; None for an instance in the root graph.
+    def walk(path, sg, host, fed, depth):
+        if depth >= 10:     # ui_to_api expands ten levels
+            return
+        definition_of[path] = sg
+        instances.setdefault(sg.get('id'), []).append(path)
+        nodes = {n.get('id'): n for n in sg.get('nodes') or []}
+        links = {
+            lnk.get('id'): lnk for lnk in sg.get('links') or []
+            if isinstance(lnk, dict)
+        }
+        linked = {
+            inp.get('name') for inp in host.get('inputs') or []
+            if inp.get('link') is not None
+        }
+        backed = _subgraph_widget_targets(sg)
+        own = {}
+        for sg_input in sg.get('inputs') or []:
+            name = sg_input.get('name')
+            if fed is not None:
+                source = fed.get(name)
+            elif name in backed and name not in linked:
+                source = (path, name)
+                heads[source] = {source} | {
+                    ('{}:{}'.format(path, inner_path), widget)
+                    for inner_path, _, widget in _promoted_widget_chain(sg, name, defs)}
+            else:
+                continue
+            if source is None:
+                continue
+            own[name] = source
+            source_of[(path, name)] = source
+            for link_id in sg_input.get('linkIds') or []:
+                link = links.get(link_id) or {}
+                inner = nodes.get(link.get('target_id'))
+                slot = link.get('target_slot')
+                if (inner is None or definition(inner) is not None
+                        or inner.get('type') == 'Reroute'
+                        or not isinstance(slot, int)
+                        or not 0 <= slot < len(inner.get('inputs') or [])):
+                    continue
+                key = ('{}:{}'.format(path, inner.get('id')),
+                       inner['inputs'][slot].get('name'))
+                if key not in source_of:
+                    source_of[key] = source
+                    members.setdefault(source, []).append(key)
+        sg_inputs = sg.get('inputs') or []
+        for node in sg.get('nodes') or []:
+            nested = definition(node)
+            if nested is None:
+                continue
+            nested_fed = {}
+            for inp in node.get('inputs') or []:
+                link = links.get(inp.get('link')) or {}
+                slot = link.get('origin_slot')
+                if (link.get('origin_id') == -10 and isinstance(slot, int)
+                        and 0 <= slot < len(sg_inputs)):
+                    nested_fed[inp.get('name')] = own.get(
+                        sg_inputs[slot].get('name'))
+            walk('{}:{}'.format(path, node.get('id')), nested, node,
+                 nested_fed, depth + 1)
+
+    for node in workflow_json.get('nodes') or []:
+        sg = definition(node)
+        if sg is not None:
+            walk(str(node.get('id')), sg, node, None, 0)
+
+    params = [p for p in gizmo_params
+              if not p.get('_is_primitive') and p.get('role', 'knob') == 'knob']
+    taken = {_param_key(p) for p in params}
+    result = {}
+    for p in params:
+        if (p.get('node_type') in ('NukomfyRead', 'NukomfyWrite')
+                or p.get('_v3_master')):
+            continue
+        key = _param_key(p)
+        source = source_of.get(key)
+        if source is not None:
+            if key not in heads.get(source, ()):
+                continue
+            targets = members.get(source, [])
+        else:
+            path, _, inner_id = key[0].rpartition(':')
+            sg = definition_of.get(path) or {}
+            node = next((n for n in sg.get('nodes') or []
+                         if str(n.get('id')) == inner_id), None)
+            if node is None or definition(node) is not None or any(
+                    inp.get('name') == key[1] and inp.get('link') is not None
+                    for inp in node.get('inputs') or []):
+                continue
+            targets = [('{}:{}'.format(other, inner_id), key[1])
+                       for other in instances[sg.get('id')]]
+        targets = [t for t in targets if t == key or t not in taken]
+        if targets and targets != [key]:
+            result[key] = targets
+    return result
+
+
 def is_api_format(workflow):
     """Check if a workflow is already in API format.
     API format has node IDs as keys with 'class_type' and 'inputs'.
@@ -358,6 +614,13 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
     subgraph_input_mappings = {}
     subgraph_output_mappings = {}
     subgraph_slot_to_input_idx = {}
+    # Expanded inner node id -> {widget_name: value held by its instance}.
+    promoted_values = {}
+    # (socket id, input name, first widget id, widget name) for each inner
+    # socket fed by a promoted input.
+    promoted_sockets = []
+    # Expanded instance id -> the types of its inputs, by slot.
+    instance_input_types = {}
 
     max_iterations = 10
     iteration = 0
@@ -371,12 +634,24 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
             node_type = node.get('type')
             node_id = node.get('id')
 
-            if _is_subgraph_uuid(node_type) and node_type in subgraph_defs:
+            # A muted or bypassed instance stays one skipped node, as in the
+            # frontend: none of its inner nodes are sent, and a bypass passes
+            # its inputs through (trace_through_bypassed).
+            if (_is_subgraph_uuid(node_type) and node_type in subgraph_defs
+                    and node.get('mode', 0) not in _SKIPPED_NODE_MODES):
                 found_subgraph = True
                 subgraph_def = subgraph_defs[node_type]
                 sg_nodes, sg_links, input_map, output_map = _expand_subgraph(
                     node_id, subgraph_def, links
                 )
+                for (inner_id, widget_name), value in _promoted_host_values(
+                        node, subgraph_def).items():
+                    promoted_values.setdefault(
+                        f"{node_id}:{inner_id}", {})[widget_name] = value
+                for socket_id, name, widget_id, widget_name in (
+                        _promoted_socket_feeds(node, subgraph_def)):
+                    promoted_sockets.append((f"{node_id}:{socket_id}", name,
+                                             f"{node_id}:{widget_id}", widget_name))
 
                 expanded_nodes.extend(sg_nodes)
                 links.extend(sg_links)
@@ -386,6 +661,8 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
 
                 outer_inputs = node.get('inputs', [])
                 subgraph_inputs = subgraph_def.get('inputs', [])
+                instance_input_types[str(node_id)] = [
+                    inp.get('type') for inp in outer_inputs]
 
                 subgraph_input_name_to_idx = {}
                 for idx, sg_input in enumerate(subgraph_inputs):
@@ -475,6 +752,10 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
 
     # Update links to handle subgraph inputs and outputs
     node_input_updates = {}
+    # Link entering an expanded instance -> the type of the instance input:
+    # the frontend resolves what the link carries with that type, not with
+    # the type of the inner input it is rewired to.
+    boundary_types = {}
 
     updated_links = []
     for link in links:
@@ -491,6 +772,9 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
 
             target_id_str = str(target_id)
             all_targets = resolve_subgraph_input_all(target_id_str, target_slot)
+            instance_types = instance_input_types.get(target_id_str) or []
+            if isinstance(target_slot, int) and 0 <= target_slot < len(instance_types):
+                boundary_types[link_id] = instance_types[target_slot]
 
             for resolved_target_id, resolved_target_slot in all_targets:
                 if resolved_target_id != target_id_str:
@@ -637,8 +921,12 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
 
         return (source_node_id, source_slot)
 
-    # Helper: trace through bypassed nodes
-    def trace_through_bypassed(source_node_id, source_slot, visited=None):
+    # Helper: trace through bypassed nodes. The input passed on is the one the
+    # frontend picks (_bypass_input_index on _frontend_inputs); when it is
+    # unlinked, or there is none, the source stays the bypassed node and the
+    # socket gets nothing. Upstream, the target type becomes the picked
+    # input's, or the instance input's where the link enters a subgraph.
+    def trace_through_bypassed(source_node_id, source_slot, target_type, visited=None):
         if visited is None:
             visited = set()
         if source_node_id in visited:
@@ -648,50 +936,32 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
         if source_node_id not in bypassed_nodes:
             return (source_node_id, source_slot)
 
-        for node in workflow_nodes:
-            if str(node.get('id')) == str(source_node_id):
-                node_inputs = node.get('inputs', [])
-                node_outputs = node.get('outputs', [])
+        node = node_by_id.get(str(source_node_id), {})
+        inputs = _frontend_inputs(node, widget_orders,
+                                  subgraph_defs.get(node.get('type')))
+        index = _bypass_input_index(inputs, node.get('outputs') or [],
+                                    source_slot, target_type)
+        if not 0 <= index < len(inputs):
+            return (source_node_id, source_slot)
+        input_link = inputs[index].get('link')
+        if input_link is None or input_link not in link_map:
+            return (source_node_id, source_slot)
 
-                output_type = None
-                if node_outputs and source_slot < len(node_outputs):
-                    output_type = node_outputs[source_slot].get('type')
-
-                if node_inputs:
-                    linked_input = None
-                    fallback_linked_input = None
-
-                    for idx, input_info in enumerate(node_inputs):
-                        input_link = input_info.get('link')
-                        input_type = input_info.get('type')
-
-                        if input_link is not None and input_link in link_map:
-                            if fallback_linked_input is None:
-                                fallback_linked_input = input_link
-                            if output_type and input_type == output_type:
-                                linked_input = input_link
-                                break
-
-                    if linked_input is None:
-                        linked_input = fallback_linked_input
-
-                    if linked_input is not None:
-                        link_data = link_map[linked_input]
-                        upstream_source_id = link_data['source_id']
-                        upstream_source_slot = link_data['source_slot']
-
-                        upstream_source_id, upstream_source_slot = trace_through_get_set_nodes(
-                            upstream_source_id, upstream_source_slot
-                        )
-                        upstream_source_id, upstream_source_slot = trace_through_reroute(
-                            upstream_source_id, upstream_source_slot
-                        )
-                        return trace_through_bypassed(
-                            upstream_source_id, upstream_source_slot, visited
-                        )
-                break
-
-        return (source_node_id, source_slot)
+        link_data = link_map[input_link]
+        upstream_source_id, upstream_source_slot = trace_through_get_set_nodes(
+            link_data['source_id'], link_data['source_slot']
+        )
+        upstream_source_id, upstream_source_slot = trace_through_reroute(
+            upstream_source_id, upstream_source_slot
+        )
+        # A PrimitiveNode gives its value to the widget it feeds only: the
+        # frontend resolves nothing through it, so nothing passes the bypass.
+        if str(upstream_source_id) in primitive_values:
+            return (source_node_id, source_slot)
+        return trace_through_bypassed(
+            upstream_source_id, upstream_source_slot,
+            boundary_types.get(input_link, inputs[index].get('type')), visited
+        )
 
     # Helper: trace through Reroute nodes
     def trace_through_reroute(source_node_id, source_slot, visited=None):
@@ -710,6 +980,7 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
 
     # Build API format prompt
     api_prompt = {}
+    linked_inputs = {}   # node id -> names of the inputs set from a link
 
     for node in workflow_nodes:
         node_id = str(node.get('id'))
@@ -745,6 +1016,7 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
         # Process inputs (connections via links)
         link_inputs = {}
         primitive_inputs = {}
+        specs = _input_specs(node_type, widget_orders)
         node_inputs = node.get('inputs', [])
 
         if node_inputs:
@@ -766,7 +1038,8 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
 
                     if str(actual_source_id) in bypassed_nodes:
                         actual_source_id, actual_source_slot = trace_through_bypassed(
-                            actual_source_id, actual_source_slot
+                            actual_source_id, actual_source_slot,
+                            boundary_types.get(input_link, input_info.get('type'))
                         )
                         if str(actual_source_id) in bypassed_nodes:
                             continue
@@ -784,7 +1057,8 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
                     source_node_id_str = str(actual_source_id)
 
                     if source_node_id_str in primitive_values:
-                        primitive_inputs[input_name] = primitive_values[source_node_id_str]
+                        primitive_inputs[input_name] = _prompt_widget_value(
+                            primitive_values[source_node_id_str], specs.get(input_name))
                     elif actual_source_id in nodes_to_exclude:
                         pass
                     elif actual_source_id in bypassed_nodes:
@@ -794,7 +1068,7 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
                     else:
                         link_inputs[input_name] = [str(actual_source_id), actual_source_slot]
 
-        ordered_inputs = _get_ordered_inputs(node_type, node, widget_orders)
+        ordered_inputs = _get_ordered_inputs(node_type, widget_orders)
 
         widget_values = node.get('widgets_values')
         widget_inputs = {}
@@ -808,15 +1082,13 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
                         widget_inputs[key] = value
 
             elif isinstance(widget_values, list):
-                has_dict_widgets = any(isinstance(v, dict) for v in widget_values)
+                filtered_values = _filter_control_values(widget_values)
+                widget_mappings = _get_widget_mappings(node_type, node, widget_orders,
+                                                       filtered_values)
 
-                if has_dict_widgets:
+                if _uses_dict_path(filtered_values, widget_mappings, specs):
                     _process_dict_widget_values(widget_values, widget_inputs, link_inputs)
                 else:
-                    filtered_values = _filter_control_values(widget_values)
-                    widget_mappings = _get_widget_mappings(node_type, node, widget_orders,
-                                                           filtered_values)
-
                     if widget_mappings:
                         for i, value in enumerate(filtered_values):
                             if i < len(widget_mappings):
@@ -828,12 +1100,24 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
                                 if (widget_name
                                         and widget_name not in link_inputs
                                         and widget_name not in primitive_inputs):
-                                    widget_inputs[widget_name] = value
+                                    widget_inputs[widget_name] = _prompt_widget_value(
+                                        value, specs.get(widget_name))
+                        # Dicts past the declared widgets belong to widgets
+                        # only the frontend knows (LoRA rows next to combos).
+                        extra = filtered_values[len(widget_mappings):]
+                        if any(isinstance(value, dict) for value in extra):
+                            _process_dict_widget_values(extra, widget_inputs, link_inputs)
                     else:
                         if filtered_values and warn_unmapped:
                             _log.warning(
                                 "Workflow node type '%s' (id %s) unknown - widget values not mapped",
                                 node_type, node_id)
+
+        # A promoted subgraph widget takes the value its instance holds, as in
+        # the frontend's prompt; a link or a PrimitiveNode still wins.
+        for name, value in promoted_values.get(node_id, {}).items():
+            if name not in link_inputs and name not in primitive_inputs:
+                widget_inputs[name] = _prompt_widget_value(value)
 
         default_inputs = _get_default_inputs(node_type, widget_inputs, primitive_inputs, link_inputs, widget_orders)
 
@@ -878,9 +1162,168 @@ def ui_to_api(workflow_json, widget_orders, warn_unmapped=True):
 
         _normalize_combo_values(node_type, api_node['inputs'], widget_orders)
 
+        if node_type == 'CustomCombo':
+            _set_custom_combo_index(node, api_node['inputs'], 'choice' in link_inputs)
+
         api_prompt[node_id] = api_node
+        linked_inputs[node_id] = list(link_inputs)
+
+    # As in the frontend's prompt, a socket fed by a promoted input gets the
+    # input's value too: the instance's, or else what its first widget gets.
+    # A link that reaches the socket through the instances wins. An array is
+    # boxed, as the frontend does, so it is not read as a link.
+    for node_id, name, widget_id, widget_name in promoted_sockets:
+        if node_id not in api_prompt:
+            continue
+        socket = next((inp for inp in node_by_id[node_id].get('inputs') or []
+                       if inp.get('name') == name), {})
+        if socket.get('link') is not None:
+            continue
+        value = promoted_values.get(widget_id, {}).get(
+            widget_name,
+            api_prompt.get(widget_id, {}).get('inputs', {}).get(widget_name))
+        if value is not None:
+            api_prompt[node_id]['inputs'][name] = (
+                {'__value__': value} if isinstance(value, list) else value)
+
+    # As in the frontend's prompt, an input whose source is not sent (a muted
+    # node or subgraph) is left out instead of linking to a missing node.
+    for node_id, names in linked_inputs.items():
+        inputs = api_prompt[node_id]['inputs']
+        for name in names:
+            source = inputs.get(name)
+            if isinstance(source, list) and source[0] not in api_prompt:
+                del inputs[name]
 
     return api_prompt
+
+
+def _is_valid_connection(type_a, type_b):
+    """Return whether two slot types connect, as LiteGraph.isValidConnection.
+
+    An empty or '*' type fits any, a comma-separated type fits when one of
+    its members does, and names compare case-insensitively.
+    """
+    if not type_a or not type_b or '*' in (type_a, type_b) or type_a == type_b:
+        return True
+    type_a, type_b = str(type_a).lower(), str(type_b).lower()
+    if ',' not in type_a and ',' not in type_b:
+        return type_a == type_b
+    return any(_is_valid_connection(a, b)
+               for a in type_a.split(',') for b in type_b.split(','))
+
+
+def _bypass_input_index(inputs, outputs, slot, target_type):
+    """Return the index of the input a bypassed node passes to `slot`, or -1.
+
+    Same choice as the frontend's ExecutableNodeDTO._getBypassSlotIndex, for
+    a target socket of `target_type`: links are not looked at, so an
+    unlinked pick passes nothing.
+    """
+    if target_type in ('*', ''):
+        return slot if len(inputs) > slot else 0
+    output_type = outputs[slot].get('type') if slot < len(outputs) else None
+    if slot < len(inputs):
+        opposite_type = inputs[slot].get('type')
+        if (_is_valid_connection(opposite_type, output_type)
+                and _is_valid_connection(opposite_type, target_type)):
+            return slot
+    for index, input_info in enumerate(inputs):
+        if input_info.get('type') == target_type:
+            return index
+    for index, input_info in enumerate(inputs):
+        input_type = input_info.get('type')
+        if (_is_valid_connection(input_type, output_type)
+                and _is_valid_connection(input_type, target_type)):
+            return index
+    return -1
+
+
+def _frontend_inputs(node, widget_orders, subgraph_def=None):
+    """Return the node's inputs in the order the frontend holds them.
+
+    Loading a file, the frontend rebuilds each node's inputs from its
+    definition: sockets, then widget inputs (a dynamic combo's own inputs
+    right after it), then the inputs the definition lacks; a subgraph
+    instance's from its subgraph's inputs. Export leaves the unlinked widget
+    inputs out of the file and the bypass rule picks by position, so they
+    are put back here, unlinked. Without a definition the file's list is
+    used.
+    """
+    inputs = node.get('inputs') or []
+    if subgraph_def is not None:
+        by_name = {input_info.get('name'): input_info for input_info in inputs}
+        return [by_name.get(slot.get('name'))
+                or {'name': slot.get('name'), 'type': slot.get('type'), 'link': None}
+                for slot in subgraph_def.get('inputs') or []]
+    node_info = widget_orders.get(node.get('type')) or {}
+    specs = {}
+    for section in ('required', 'optional'):
+        specs.update((node_info.get('input') or {}).get(section) or {})
+    if not specs:
+        return inputs
+    # /object_info lists the inputs in input_order, the frontend's order.
+    rank = {name: index for index, name in enumerate(specs)}
+    names = [str(input_info.get('name')) for input_info in inputs]
+    groups = {name.split('.')[0] for name in names if '.' in name}
+    # A defined input the file lacks is taken as a widget input left out by
+    # Export (a socket added to the definition after the file was saved
+    # would be misplaced). An autogrow input appears only as its dotted
+    # group, a dynamic combo also under its own name.
+    missing = []
+    for name in rank:
+        if name not in names and (
+                name not in groups or _classify_widget_spec(specs[name])[1]):
+            spec_type = specs[name][0]
+            missing.append({'name': name, 'link': None,
+                            'type': spec_type if isinstance(spec_type, str) else 'COMBO'})
+    widget_bases = {stub['name'] for stub in missing} | {
+        name if name in rank else name.split('.')[0]
+        for name, input_info in zip(names, inputs) if input_info.get('widget')}
+
+    def position(item):
+        index, input_info = item
+        name = str(input_info.get('name'))
+        base = name if name in rank else name.split('.')[0]
+        if base not in rank:
+            return (2, 0, False, index)
+        return (1 if base in widget_bases else 0, rank[base], name != base, index)
+
+    ranked = [(-1, stub) for stub in missing] + list(enumerate(inputs))
+    return [input_info for _, input_info in sorted(ranked, key=position)]
+
+
+def _input_specs(node_type, widget_orders):
+    """Return ``{input_name: spec}`` for the node type's declared inputs."""
+    node_input = (widget_orders.get(node_type) or {}).get('input') or {}
+    specs = {}
+    for section in ('required', 'optional'):
+        specs.update(node_input.get(section) or {})
+    return specs
+
+
+def _uses_dict_path(values, mappings, specs):
+    """Return whether a node's widgets_values go to _process_dict_widget_values.
+
+    That path serves nodes whose widgets exist only in the frontend (a LoRA
+    stack's rows), so a list holding a dict takes it when /object_info
+    declares no widget with a slot, or when a dict falls on a plain widget's
+    slot (a layout the positional reading does not know). Otherwise the list
+    is read by position, object-valued widgets included.
+    """
+    if not any(isinstance(value, dict) for value in values):
+        return False
+    objects, declared = set(), False
+    for name, spec in specs.items():
+        slots = _object_widget_slots(name, spec, [])
+        if slots is not None:
+            objects.add(name)
+        declared = declared or bool(slots) or _classify_widget_spec(spec)[0]
+    if not declared:
+        return True
+    return any(isinstance(value, dict) and index < len(mappings)
+               and mappings[index] and mappings[index] not in objects
+               for index, value in enumerate(values))
 
 
 def _process_dict_widget_values(widget_values, widget_inputs, link_inputs):
@@ -934,14 +1377,10 @@ def _filter_control_values(widget_values):
     return filtered
 
 
-def _get_ordered_inputs(node_type, node, widget_orders):
+def _get_ordered_inputs(node_type, widget_orders):
     """Get the ordered list of all inputs (widgets + connections) for a node type.
     Reads order from widget_orders[t]['input_order'] (from /object_info).
     """
-    properties = node.get('properties', {})
-    if 'Node name for S&R' in properties:
-        node_type = properties['Node name for S&R']
-
     node_info = widget_orders.get(node_type) or {}
 
     # Primary: widget_orders[t]['input_order']
@@ -968,28 +1407,97 @@ def _get_ordered_inputs(node_type, node, widget_orders):
     return []
 
 
+def _declared_widget_type(input_spec):
+    """Return the type that decides whether an input is a widget.
+
+    A multi-type input ("FLOAT,INT") names its widget type in `widgetType`,
+    as io.MultiType does. A single type is kept even when it carries a
+    `widgetType`: Painter.mask is a STRING value drawn by a custom widget.
+    """
+    input_type = input_spec[0]
+    options = input_spec[1] if len(input_spec) > 1 and isinstance(input_spec[1], dict) else {}
+    if isinstance(input_type, str) and ',' in input_type and options.get('widgetType'):
+        return options['widgetType']
+    return input_type
+
+
 def _classify_widget_spec(input_spec):
     """Return (is_widget, is_dynamic_combo) for an /object_info input spec.
 
     COLOR is a serialized hex-string widget (Painter.bg_color,
     ColorToRGBInt.color) and takes a widgets_values slot, matching the
-    parser's _WIDGET_TYPES. Other uppercase V3 widget types (CURVE,
-    BOUNDING_BOX, WEBCAM, IMAGECOMPARE) stay classified as sockets: the
-    frontend persists them inconsistently (IMAGECOMPARE sets
-    widget.serialize=False) and no reachable node exposes them today.
+    parser's _WIDGET_TYPES. Other uppercase widget types stay classified as
+    sockets here: the object-valued ones (CURVE, BOUNDING_BOX, ...) are
+    placed by _object_widget_slots, which knows how many slots each fills.
     """
     if not (isinstance(input_spec, (list, tuple)) and len(input_spec) >= 1):
         return False, False
-    input_type = input_spec[0]
+    input_type = _declared_widget_type(input_spec)
     if isinstance(input_type, (list, tuple)):
         return True, False
     if input_type in ['INT', 'FLOAT', 'STRING', 'BOOLEAN', 'COMBO', 'COLOR']:
         return True, False
     if isinstance(input_type, str) and input_type.startswith('COMFY_') and 'COMBO' in input_type:
         return True, True
-    if isinstance(input_type, str) and not input_type.isupper():
+    # Custom widget types carry lowercase letters; "*" (any type) has none
+    # and is a socket.
+    if isinstance(input_type, str) and input_type != input_type.upper():
         return True, False
     return False, False
+
+
+# Widget types the frontend builds for a structured value (an object or a
+# list) and saves in widgets_values like any other widget. Left out: WEBCAM
+# and AUDIO_RECORD, whose value is captured in the browser, and RANGE, which
+# no node uses.
+_OBJECT_WIDGET_TYPES = frozenset({
+    'BOUNDING_BOX', 'BOUNDING_BOXES', 'COLORS', 'COMPOSITOR', 'CURVE',
+    'LOAD_3D', 'VIDEO_EDIT'})
+
+
+def _object_widget_slots(input_name, input_spec, widget_names, node_type=None):
+    """Return the widgets_values slots an object-valued widget fills, or None.
+
+    The frontend adds helper widgets that are saved but not sent (None in the
+    result): BOUNDING_BOX is followed by its x, y, width and height, LOAD_3D
+    is preceded by three buttons when the node has a model_file widget
+    (`widget_names` holds the widgets placed so far), except on
+    Load3DAdvanced, which the frontend gives its own widget. IMAGECOMPARE is
+    not saved at all. None for any other input, and for a socket-only one.
+    """
+    if not (isinstance(input_spec, (list, tuple)) and input_spec
+            and isinstance(input_spec[0], str)):
+        return None
+    input_type = input_spec[0]
+    options = input_spec[1] if len(input_spec) > 1 and isinstance(input_spec[1], dict) else {}
+    if options.get('forceInput'):
+        return None
+    if input_type == 'IMAGECOMPARE':
+        return []
+    if input_type not in _OBJECT_WIDGET_TYPES:
+        return None
+    if input_type == 'BOUNDING_BOX':
+        return [input_name, None, None, None, None]
+    if (input_type == 'LOAD_3D' and 'model_file' in widget_names
+            and node_type != 'Load3DAdvanced'):
+        return [None, None, None, input_name]
+    return [input_name]
+
+
+def _prompt_widget_value(value, input_spec=None):
+    """Return a widget value as the frontend's prompt carries it.
+
+    A list would read as a link, so it is boxed; a curve widget's value
+    carries a type marker. The server unwraps both. A value promoted from a
+    subgraph input (no `input_spec`) only has its lists boxed, as in the
+    frontend.
+    """
+    if (value is not None and isinstance(input_spec, (list, tuple))
+            and input_spec and input_spec[0] == 'CURVE'):
+        return {'__type__': 'CURVE', '__value__': value}
+    if isinstance(value, list):
+        return {'__value__': value}
+    return value
 
 
 def _get_dynamic_combo_sub_inputs(input_name, input_spec, widget_values, current_idx):
@@ -1063,10 +1571,8 @@ def _get_widget_mappings(node_type, node, widget_orders, filtered_values):
     length guards must index/measure that same list, not the raw one
     (the raw list still holds the control_after_generate companions).
     """
-    properties = node.get('properties', {})
-    if 'Node name for S&R' in properties:
-        node_type = properties['Node name for S&R']
-
+    # Looked up by type, as the frontend does: "Node name for S&R" is a
+    # user-editable alias (for %Name.widget% in file names), not a class.
     node_info = widget_orders.get(node_type) or {}
 
     # Primary: widget_orders[t]['input']
@@ -1079,6 +1585,13 @@ def _get_widget_mappings(node_type, node, widget_orders, filtered_values):
             for section in ['required', 'optional']:
                 if section in input_def:
                     for input_name, input_spec in input_def[section].items():
+                        slots = _object_widget_slots(input_name, input_spec, widget_names,
+                                                     node_type)
+                        if slots is not None:
+                            widget_names.extend(slots)
+                            widget_idx += len(slots)
+                            continue
+
                         is_widget, is_dynamic_combo = _classify_widget_spec(input_spec)
 
                         if is_widget:
@@ -1102,9 +1615,10 @@ def _get_widget_mappings(node_type, node, widget_orders, filtered_values):
         return []
 
     # Try ue_properties.widget_ue_connectable
-    properties = node.get('properties', {})
-    ue_properties = properties.get('ue_properties', {})
-    widget_ue_connectable = ue_properties.get('widget_ue_connectable', {})
+    properties = node.get('properties')
+    ue_properties = properties.get('ue_properties') if isinstance(properties, dict) else None
+    widget_ue_connectable = (ue_properties.get('widget_ue_connectable', {})
+                             if isinstance(ue_properties, dict) else {})
 
     if widget_ue_connectable and isinstance(widget_ue_connectable, dict):
         widget_names = list(widget_ue_connectable.keys())
@@ -1115,7 +1629,7 @@ def _get_widget_mappings(node_type, node, widget_orders, filtered_values):
     connected_inputs = set()
     widget_flagged_inputs = []
 
-    for input_info in node.get('inputs', []):
+    for input_info in node.get('inputs') or []:
         input_name = input_info.get('name')
         if input_name:
             all_inputs.append(input_name)
@@ -1164,13 +1678,18 @@ def _get_default_inputs(node_type, widget_inputs, primitive_inputs, link_inputs,
                     spec_options = input_spec[1] if len(input_spec) >= 2 else {}
 
                     if isinstance(spec_options, dict) and 'default' in spec_options:
-                        default_inputs[input_name] = spec_options['default']
+                        default_inputs[input_name] = _prompt_widget_value(
+                            spec_options['default'], input_spec)
                     elif isinstance(input_type, list) and len(input_type) > 0:
                         default_inputs[input_name] = input_type[0]
                     elif input_type == 'COMBO' and isinstance(spec_options, dict) and 'options' in spec_options:
                         options = spec_options['options']
                         if isinstance(options, list) and len(options) > 0:
                             default_inputs[input_name] = options[0]
+                    elif input_type == 'IMAGECOMPARE':
+                        # Never saved: the prompt carries the widget's
+                        # initial value.
+                        default_inputs[input_name] = _prompt_widget_value(['', ''])
     except Exception:
         pass
 
@@ -1216,6 +1735,25 @@ def _normalize_combo_values(node_type, inputs, widget_orders):
                 if isinstance(option, str) and value.lower() == option.lower():
                     inputs[input_name] = option
                     break
+
+
+def _set_custom_combo_index(node, inputs, choice_linked):
+    """Add CustomCombo's hidden `index` input: the chosen option's position.
+
+    The server outputs `index` as INDEX (0 when absent), and /object_info
+    lists only `choice`: the options are frontend widgets saved after the
+    choice and the index, `[choice, index, option1, ...]`. As in the
+    frontend, the position is that of the value sent as `choice`, or of the
+    node's own value when `choice` is linked; -1 when it is not an option.
+    """
+    # The raw list: the control-value filter would drop an option named
+    # 'fixed' that follows the integer index.
+    values = node.get('widgets_values')
+    if not isinstance(values, list) or not values:
+        return
+    choice = values[0] if choice_linked else inputs.get('choice')
+    options = values[2:]
+    inputs['index'] = options.index(choice) if choice in options else -1
 
 
 # ===========================================================================
@@ -1329,11 +1867,19 @@ def normalize_v3_sub_enabled(gizmo_params, gizmo_node):
             p['enabled'] = True
 
 
-def inject_knob_values(api_workflow, gizmo_params, gizmo_node):
+def param_targets(p, targets):
+    """The (node id, input) pairs a param's value is written to: its own, or
+    those param_value_targets lists for it."""
+    key = _param_key(p)
+    return (targets or {}).get(key, [key])
+
+
+def inject_knob_values(api_workflow, gizmo_params, gizmo_node, targets=None):
     """Replace values in the API workflow with current knob values from the gizmo.
 
     Reads each enabled param's _knob_name from the gizmo node and sets
-    api_workflow[target_node_id]["inputs"][widget_name] = value.
+    api_workflow[target_node_id]["inputs"][widget_name] = value, and the
+    same on the other inputs `targets` (param_value_targets) lists for it.
 
     Modifies api_workflow in place.
     """
@@ -1397,11 +1943,9 @@ def inject_knob_values(api_workflow, gizmo_params, gizmo_node):
             elif ptype == 'BOOLEAN':
                 value = bool(value)
 
-        nid = str(p.get('target_node_id', ''))
-        wname = p.get('widget_name', p.get('name', ''))
-
-        if nid in api_workflow:
-            api_workflow[nid]['inputs'][wname] = value
+        for nid, wname in param_targets(p, targets):
+            if nid in api_workflow:
+                api_workflow[nid]['inputs'][wname] = value
 
 
 def strip_v3_inactive_subs(api_workflow, gizmo_params, gizmo_node):
@@ -1582,7 +2126,7 @@ def _coerce_value(value, ptype):
     return value
 
 
-def inject_param_defaults(api_workflow, gizmo_params):
+def inject_param_defaults(api_workflow, gizmo_params, targets=None):
     """Apply Workflow Creator `default_value` for unchecked params.
 
     Enabled params are handled by inject_knob_values (reading from the
@@ -1591,7 +2135,7 @@ def inject_param_defaults(api_workflow, gizmo_params):
     `widgets_values`, ignoring any default the user set in the Workflow
     Creator. File path params (role input/output) are skipped - their
     values are resolved at submit time by inject_input_paths /
-    inject_output_params.
+    inject_output_params. `targets` as in inject_knob_values.
 
     Modifies api_workflow in place.
     """
@@ -1605,11 +2149,10 @@ def inject_param_defaults(api_workflow, gizmo_params):
         dv = p.get('default_value')
         if dv is None:
             continue
-        nid = str(p.get('target_node_id', ''))
-        wname = p.get('widget_name', p.get('name', ''))
-        if not nid or not wname or nid not in api_workflow:
-            continue
-        api_workflow[nid]['inputs'][wname] = _coerce_value(dv, p.get('type', ''))
+        value = _coerce_value(dv, p.get('type', ''))
+        for nid, wname in param_targets(p, targets):
+            if nid and wname and nid in api_workflow:
+                api_workflow[nid]['inputs'][wname] = value
 
 
 def _seed_max_for(param):
@@ -1628,7 +2171,7 @@ def random_seed_value(param):
 
 
 def apply_seed_control(api_workflow, gizmo_params, gizmo_node,
-                       batch_idx, base_seeds):
+                       batch_idx, base_seeds, targets=None):
     """Apply seed control_after_generate logic to a single batch iteration.
 
     Reads each is_seed param's `{knob}_control` Enumeration_Knob on the
@@ -1646,7 +2189,8 @@ def apply_seed_control(api_workflow, gizmo_params, gizmo_node,
 
     Randomize range matches ComfyUI frontend (2^50) but is capped to the
     seed widget's real max. Manual input, increment and decrement are all
-    clamped to [0, min(2^64-1, real max)].
+    clamped to [0, min(2^64-1, real max)]. `targets` as in
+    inject_knob_values.
     """
     used = {}
     for p in gizmo_params:
@@ -1683,10 +2227,9 @@ def apply_seed_control(api_workflow, gizmo_params, gizmo_node,
                 if tid and twn and tid in api_workflow:
                     api_workflow[tid]['inputs'][twn] = value
         else:
-            nid = str(p.get('target_node_id', ''))
-            wname = p.get('widget_name', p.get('name', ''))
-            if nid in api_workflow:
-                api_workflow[nid]['inputs'][wname] = value
+            for nid, wname in param_targets(p, targets):
+                if nid in api_workflow:
+                    api_workflow[nid]['inputs'][wname] = value
         used[knob_name] = value
     return used
 

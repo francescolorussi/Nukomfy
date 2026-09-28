@@ -1,7 +1,7 @@
 <p align="center"><img src="docs/images/logo.png" alt="Nukomfy" width="300"></p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.0-orange" alt="Version 0.1.0">
+  <img src="https://img.shields.io/badge/version-0.1.1-orange" alt="Version 0.1.1">
   <img src="https://img.shields.io/badge/license-Apache_2.0-blue" alt="License: Apache 2.0">
   <img src="https://img.shields.io/badge/Nuke-14.1%2B-F9B41B" alt="Nuke 14.1+">
   <a href="https://www.nukepedia.com/tools/python/render/nukomfy/"><img src="https://img.shields.io/badge/Nukepedia-Nukomfy-%23E04D19" alt="Nukepedia"></a>
@@ -14,6 +14,8 @@ TDs set up each gizmo once. Artists tweak only the essential knobs, directly in 
 ## Demo
 
 https://github.com/user-attachments/assets/5120bfa3-8b6a-4083-87aa-6c2aa44be6b9
+
+*In the video, widgets are exposed from inside a subgraph. From ComfyUI 0.29.0 they must be promoted to the subgraph node first: see [Prepare the workflow in ComfyUI](USER_GUIDE.md#prepare-the-workflow-in-comfyui).*
 
 ## How it works
 

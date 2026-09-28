@@ -22,7 +22,8 @@ from Nukomfy.core.identity import current_user, ws_session_id
 from Nukomfy.core.settings import settings
 from Nukomfy.gui.ui_state import ui_state
 from Nukomfy.gui.workers import UnifiedFetchWorker, stop_worker
-from Nukomfy.gui._render_data_store import RenderDataStore
+from Nukomfy.gui._render_data_store import (
+    RenderDataStore, _attach_client_machine_url)
 from Nukomfy.gui.icons import (icon_font, set_press_icon, _ensure_loaded,
                                CLOSE, REMOVE, REFRESH,
                                DESCRIPTION, VIEW_LIST, FILE_DOWNLOAD)
@@ -749,7 +750,7 @@ class _JobDialog(QtWidgets.QDialog):
         if isinstance(self._current_entry, dict):
             url = self._current_entry.get('nfy_machine_url', '') or ''
         if url:
-            entry['nfy_machine_url'] = url
+            _attach_client_machine_url(entry, url)
         self._repopulate_same_job(entry)
 
     def _repopulate_same_job(self, entry):
@@ -3190,10 +3191,10 @@ class RenderQueuePanel(QtWidgets.QDialog):
     def _schedule_store_notify(self):
         """(Re)start the debounce timer for store.notify().
 
-        Called from `_on_result` per machine; a burst of 22 results during
+        Called from `_on_result` per machine: a burst of results during
         Update All collapses into a single fan-out after the last one
-        settles. Single-machine refresh still emits once (same as before)
-        with an imperceptible 150ms delay.
+        settles, and a single-machine refresh emits once after the same
+        150 ms delay.
         """
         try:
             self._notify_timer.start()

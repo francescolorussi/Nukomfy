@@ -2365,7 +2365,7 @@ class SubmitPanel(QtWidgets.QDialog):
             inject_input_paths, inject_output_params, fetch_object_info,
             apply_seed_control, inject_primitive_values,
             strip_v3_inactive_subs, live_api_node_ids,
-            normalize_v3_sub_enabled,
+            normalize_v3_sub_enabled, param_value_targets, param_targets,
         )
 
         # Convert UI workflow to API format via ui_to_api()
@@ -2383,6 +2383,10 @@ class SubmitPanel(QtWidgets.QDialog):
         info_cache = getattr(self, '_preflight_info_cache', None)
         if not info_cache or set(node_types) - set(info_cache.keys()):
             info_cache = fetch_object_info(m.url, node_types)
+        # The inputs each param's value reaches (a promoted subgraph input
+        # feeds several), read on the UI workflow, which still has the
+        # subgraphs the API one no longer has.
+        value_targets = param_value_targets(wf, self._gizmo_params)
         # Write current gizmo knob values into PrimitiveNode
         # widgets_values BEFORE conversion, so the converter inlines
         # the up-to-date values into all target nodes.
@@ -2406,8 +2410,9 @@ class SubmitPanel(QtWidgets.QDialog):
         normalize_v3_sub_enabled(self._gizmo_params, self._gizmo)
         # Apply Workflow Creator defaults for unchecked params, then
         # overlay values from enabled gizmo knobs.
-        inject_param_defaults(api_wf, self._gizmo_params)
-        inject_knob_values(api_wf, self._gizmo_params, self._gizmo)
+        inject_param_defaults(api_wf, self._gizmo_params, value_targets)
+        inject_knob_values(api_wf, self._gizmo_params, self._gizmo,
+                           value_targets)
         # Prune V3 sub-inputs whose master option is no longer active
         # (the converter's expansion was based on the workflow's original
         # widgets_values; the user may have switched master via knob).
@@ -2610,7 +2615,7 @@ class SubmitPanel(QtWidgets.QDialog):
 
                 used_this_iter = apply_seed_control(
                     submit_wf, self._gizmo_params, self._gizmo,
-                    batch_idx, base_seeds)
+                    batch_idx, base_seeds, value_targets)
                 if used_this_iter:
                     last_used_seeds = used_this_iter
 
@@ -2754,6 +2759,13 @@ class SubmitPanel(QtWidgets.QDialog):
                             continue
                         nid = str(p.get('target_node_id', ''))
                         name = p.get('widget_name') or p.get('name', '')
+                        # A param whose own input is not in the prompt (the
+                        # input of a nested instance, a node left out) is
+                        # recorded at an input its value reached, if any.
+                        if nid not in spec_node_ids:
+                            nid, name = next(
+                                (t for t in param_targets(p, value_targets)
+                                 if t[0] in spec_node_ids), (nid, name))
                         if not name or nid not in spec_node_ids:
                             continue
                         params_spec.append({

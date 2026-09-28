@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/images/user_guide_logo.png" alt="Nukomfy User Guide" width="300"></p>
 
-<p align="center"><em>Last updated: 2026-07-11</em></p>
+<p align="center"><em>Last updated: 2026-09-28</em></p>
 
 This is a quick reference guide for using Nukomfy: turning a ComfyUI workflow into a Nuke gizmo, submitting renders, and reading frames back into Nuke. It covers basic usage and the non-obvious behaviors. For what Nukomfy is and how to install it, see the [README](https://github.com/francescolorussi/Nukomfy#readme).
 
@@ -82,6 +82,8 @@ Everything here happens in ComfyUI, before you open the Workflow Creator.
 4. **In App Builder, expose every widget you want to become a gizmo knob.** The two Suite nodes are the exception, see below.
 5. **In App Builder, mark at least one NukomfyWrite as an output.** Required: a workflow with no marked output is rejected.
 6. **Export in UI format: File > Export.** Do not use **Export (API)**: API files are rejected.
+
+> **Widgets inside a subgraph must be promoted first.** From ComfyUI 0.29.0, App Builder only keeps widgets of nodes in the main graph: you can still tick a widget inside a subgraph, but it is dropped when you leave App Builder. To expose it, open the subgraph, right-click the widget and choose **Promote Widget**, then select it on the subgraph node in the main graph.
 
 <p align="center"><img src="docs/images/userguide/ss-04-comfyui-read-write.jpg" alt="NukomfyRead and NukomfyWrite wired into the image chain."></p>
 

@@ -501,28 +501,6 @@ def fetch_job_status(base_url, prompt_id):
     return ('ok', item) if item else ('not_found', None)
 
 
-def _fetch_history_outputs(base, prompt_id):
-    """Return the per-node `outputs` map from ComfyUI core `/history/{id}`.
-
-    Independent of the Suite manager job-history toggle: `/history` is
-    core ComfyUI in-memory state, available whenever the job is still in
-    the server's recent window. Each node's value carries its `ui` payload
-    (e.g. a NukomfyWrite node's `nukomfy_written`). Returns None when the
-    job is absent or the response is malformed.
-    """
-    if not prompt_id:
-        return None
-    raw = _get_json('{}/history/{}'.format(
-        base, urllib.parse.quote(str(prompt_id), safe='')))
-    if not isinstance(raw, dict):
-        return None
-    entry = raw.get(prompt_id)
-    if not isinstance(entry, dict):
-        return None
-    outs = entry.get('outputs')
-    return outs if isinstance(outs, dict) else None
-
-
 def _fetch_awaiting_terminals(base_url, pids, terminal_states):
     """Parallel single-pid persistent fetch for `pids`; return the entries
     the server reports as terminal (non-terminal entries and errors dropped).
@@ -751,15 +729,14 @@ def fetch_all_for_machine(base_url, known_terminal_ids=None,
         return result
 
     def _fetch_one(pid):
-        item = _parse_job_detail(_get_json('{}/api/jobs/{}'.format(
-            base, urllib.parse.quote(str(pid), safe=''))))
-        # `/api/jobs/{id}` omits the per-node outputs map (only a scalar
-        # count). The core `/history/{id}` endpoint carries it and is
-        # independent of the manager persistence toggle - enrich completed
-        # jobs with the server-confirmed write outputs.
+        detail = _get_json('{}/api/jobs/{}'.format(
+            base, urllib.parse.quote(str(pid), safe='')))
+        item = _parse_job_detail(detail)
+        # The detail carries the per-node outputs map; each node's value is
+        # its `ui` payload (e.g. a NukomfyWrite node's `nukomfy_written`).
         if item and item.get('nfy_status_str') == 'completed':
-            outs = _fetch_history_outputs(base, pid)
-            if outs:
+            outs = detail.get('outputs')
+            if isinstance(outs, dict) and outs:
                 item['nfy_outputs'] = outs
         return item
 
